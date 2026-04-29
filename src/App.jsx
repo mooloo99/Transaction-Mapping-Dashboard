@@ -1,213 +1,145 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import Papa from 'papaparse'
-import {
-  MapContainer,
-  TileLayer,
-  Marker,
-  Popup,
-  useMap,
-} from 'react-leaflet'
-import L from 'leaflet'
+import CompsMap, { COLOUR_MAP, markerColour } from './components/CompsMap.jsx'
+import CompsTable from './components/CompsTable.jsx'
+import CompsFilters from './components/CompsFilters.jsx'
+import { parseCsvText } from './utils/parseComps.js'
+import { geocodeMissing } from './utils/geocodeComps.js'
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-const AUD = new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD', maximumFractionDigits: 0 })
-const NUM = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 0 })
-
-function fmtCurrency(v) {
-  const n = parseFloat(v)
-  return isNaN(n) ? '—' : AUD.format(n)
-}
-function fmtNum(v) {
-  const n = parseFloat(v)
-  return isNaN(n) ? '—' : NUM.format(n) + ' m²'
-}
-function fmtDate(v) {
-  if (!v) return '—'
-  const d = new Date(v)
-  return isNaN(d) ? v : d.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
-}
-function fmtYield(v) {
-  const n = parseFloat(v)
-  return isNaN(n) ? '—' : n.toFixed(2) + '%'
+const DEFAULT_FILTERS = {
+  state: '', operator: '', assetType: '',
+  dateFrom: '', dateTo: '',
+  priceMin: '', priceMax: '',
+  yieldMin: '', yieldMax: '',
+  search: '',
 }
 
-function parseRow(row) {
-  const lat = parseFloat(row.latitude)
-  const lng = parseFloat(row.longitude)
-  return {
-    ...row,
-    _lat: lat,
-    _lng: lng,
-    _valid: !isNaN(lat) && !isNaN(lng),
-  }
+// normalise yield for comparison (stored as decimal 0.063 or whole 6.3)
+function normYield(v) {
+  if (v == null) return null
+  return v < 1 ? v * 100 : v
 }
-
-function dedupe(rows) {
-  const seen = new Set()
-  return rows.filter((r) => {
-    const key = [r.address, r.suburb, r.sale_date, r.sale_price_aud].join('|').toLowerCase().trim()
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
-}
-
-function unique(rows, field) {
-  return [...new Set(rows.map((r) => r[field]).filter(Boolean))].sort()
-}
-
-// ─── map controller – flies to selected row ─────────────────────────────────
-
-function MapController({ target }) {
-  const map = useMap()
-  useEffect(() => {
-    if (target) {
-      map.flyTo([target._lat, target._lng], 16, { duration: 0.8 })
-    }
-  }, [target, map])
-  return null
-}
-
-// ─── coloured marker by asset type ──────────────────────────────────────────
-
-const COLOURS = {
-  'Childcare Centre': '#2563eb',
-  'Medical Centre': '#16a34a',
-  'Service Station': '#d97706',
-  'Fast Food': '#dc2626',
-  'Retail': '#7c3aed',
-}
-function markerColour(assetType) {
-  return COLOURS[assetType] || '#64748b'
-}
-function makeIcon(colour) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="40" viewBox="0 0 28 40">
-    <path d="M14 0C6.27 0 0 6.27 0 14c0 9.33 14 26 14 26S28 23.33 28 14C28 6.27 21.73 0 14 0z" fill="${colour}" stroke="white" stroke-width="1.5"/>
-    <circle cx="14" cy="14" r="6" fill="white" opacity="0.9"/>
-  </svg>`
-  return L.divIcon({
-    html: svg,
-    className: '',
-    iconSize: [28, 40],
-    iconAnchor: [14, 40],
-    popupAnchor: [0, -38],
-  })
-}
-
-// ─── main app ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [allRows, setAllRows] = useState([])
-  const [parseError, setParseError] = useState(null)
-  const [uploadFileName, setUploadFileName] = useState(null)
-
-  // filters
-  const [filterState, setFilterState] = useState('')
-  const [filterOperator, setFilterOperator] = useState('')
-  const [filterAssetType, setFilterAssetType] = useState('')
-  const [filterDateFrom, setFilterDateFrom] = useState('')
-  const [filterDateTo, setFilterDateTo] = useState('')
-  const [search, setSearch] = useState('')
-
-  // interaction
-  const [selectedRow, setSelectedRow] = useState(null)
-  const [activePopup, setActivePopup] = useState(null)
-  const [tab, setTab] = useState('map') // 'map' | 'table'
+  const [rows, setRows]           = useState([])
+  const [filters, setFilters]     = useState(DEFAULT_FILTERS)
+  const [tab, setTab]             = useState('map')
+  const [selectedRow, setSelected]= useState(null)
+  const [flyTarget, setFlyTarget] = useState(null)
+  const [uploadFile, setUploadFile]= useState(null)
+  const [parseError, setParseError]= useState(null)
+  const [geocoding, setGeocoding] = useState(false)
+  const [geocodeStatus, setGeocodeStatus] = useState(null)
 
   const fileInputRef = useRef()
-  const tableRowRefs = useRef({})
 
-  // load sample on first render
+  // auto-load the geocoded dataset on startup
   useEffect(() => {
-    fetch('/comparable_sales.csv')
-      .then((r) => r.text())
-      .then((text) => loadCsv(text, 'comparable_sales.csv'))
-      .catch(() => {})
-  }, [])
+    fetch('/comparable_sales_geocoded.csv')
+      .then(r => r.text())
+      .then(text => {
+        const parsed = parseCsvText(text)
+        setRows(parsed)
+        setUploadFile('comparable_sales_geocoded.csv')
+        const missing = parsed.filter(r => !r._mapped).length
+        if (missing > 0) runGeocoding(parsed)
+      })
+      .catch(() => {
+        // fallback to sample
+        fetch('/comparable_sales.csv')
+          .then(r => r.text())
+          .then(text => {
+            const parsed = parseCsvText(text)
+            setRows(parsed)
+            setUploadFile('comparable_sales.csv (sample)')
+          })
+          .catch(() => {})
+      })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  function loadCsv(text, filename) {
-    setParseError(null)
-    Papa.parse(text, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: (h) => h.trim().toLowerCase().replace(/\s+/g, '_'),
-      complete: ({ data, errors }) => {
-        if (errors.length && !data.length) {
-          setParseError('Could not parse CSV. Check the file format.')
-          return
-        }
-        const rows = dedupe(data.map(parseRow))
-        setAllRows(rows)
-        setUploadFileName(filename)
-        setSelectedRow(null)
-        setActivePopup(null)
-      },
+  async function runGeocoding(inputRows) {
+    const missing = inputRows.filter(r => !r._mapped)
+    if (!missing.length) return
+    setGeocoding(true)
+    setGeocodeStatus(`Geocoding ${missing.length} rows via Nominatim…`)
+    const enriched = await geocodeMissing(inputRows, (done, total) => {
+      setGeocodeStatus(`Geocoding ${done}/${total}…`)
     })
+    setRows(enriched)
+    setGeocoding(false)
+    const stillMissing = enriched.filter(r => !r._mapped).length
+    setGeocodeStatus(stillMissing > 0 ? `${stillMissing} rows could not be geocoded` : null)
+  }
+
+  function loadText(text, filename) {
+    setParseError(null)
+    try {
+      const parsed = parseCsvText(text)
+      setRows(parsed)
+      setUploadFile(filename)
+      setSelected(null)
+      setFlyTarget(null)
+      const missing = parsed.filter(r => !r._mapped).length
+      if (missing > 0) runGeocoding(parsed)
+    } catch (e) {
+      setParseError(e.message)
+    }
   }
 
   function handleFileChange(e) {
     const file = e.target.files[0]
     if (!file) return
     const reader = new FileReader()
-    reader.onload = (ev) => loadCsv(ev.target.result, file.name)
+    reader.onload = ev => loadText(ev.target.result, file.name)
     reader.readAsText(file)
     e.target.value = ''
   }
 
-  // derived
-  const validRows = useMemo(() => allRows.filter((r) => r._valid), [allRows])
-  const invalidCount = allRows.length - validRows.length
+  function handleFilterChange(key, value) {
+    setFilters(f => ({ ...f, [key]: value }))
+  }
 
-  const states = useMemo(() => unique(validRows, 'state'), [validRows])
-  const operators = useMemo(() => unique(validRows, 'operator'), [validRows])
-  const assetTypes = useMemo(() => unique(validRows, 'asset_type'), [validRows])
+  function handleClearFilters() {
+    setFilters(DEFAULT_FILTERS)
+  }
+
+  function handleTableRowClick(row) {
+    setSelected(row)
+    if (row._mapped) {
+      setFlyTarget({ ...row, _ts: Date.now() })
+      setTab('map')
+    }
+  }
 
   const filtered = useMemo(() => {
-    const q = search.toLowerCase()
-    return validRows.filter((r) => {
-      if (filterState && r.state !== filterState) return false
-      if (filterOperator && r.operator !== filterOperator) return false
-      if (filterAssetType && r.asset_type !== filterAssetType) return false
-      if (filterDateFrom && r.sale_date && r.sale_date < filterDateFrom) return false
-      if (filterDateTo && r.sale_date && r.sale_date > filterDateTo) return false
+    const q = filters.search.toLowerCase()
+    const priceMin = filters.priceMin !== '' ? parseFloat(filters.priceMin) : null
+    const priceMax = filters.priceMax !== '' ? parseFloat(filters.priceMax) : null
+    const yMin = filters.yieldMin !== '' ? parseFloat(filters.yieldMin) : null
+    const yMax = filters.yieldMax !== '' ? parseFloat(filters.yieldMax) : null
+
+    return rows.filter(r => {
+      if (filters.state     && r.state     !== filters.state)      return false
+      if (filters.operator  && r.operator  !== filters.operator)   return false
+      if (filters.assetType && r.asset_type !== filters.assetType) return false
+      if (filters.dateFrom  && r.sale_date && r.sale_date < filters.dateFrom) return false
+      if (filters.dateTo    && r.sale_date && r.sale_date > filters.dateTo)   return false
+      if (priceMin != null  && r.sale_price_aud != null && r.sale_price_aud < priceMin) return false
+      if (priceMax != null  && r.sale_price_aud != null && r.sale_price_aud > priceMax) return false
+      const y = normYield(r.yield)
+      if (yMin != null && y != null && y < yMin) return false
+      if (yMax != null && y != null && y > yMax) return false
       if (q) {
-        const haystack = [r.address, r.suburb, r.operator].join(' ').toLowerCase()
-        if (!haystack.includes(q)) return false
+        const hay = [r.address, r.suburb, r.operator, r.asset_type].join(' ').toLowerCase()
+        if (!hay.includes(q)) return false
       }
       return true
     })
-  }, [validRows, filterState, filterOperator, filterAssetType, filterDateFrom, filterDateTo, search])
+  }, [rows, filters])
 
-  const handleMarkerClick = useCallback((row) => {
-    setActivePopup(row)
-    setSelectedRow(row)
-  }, [])
+  const mappedCount   = filtered.filter(r => r._mapped).length
+  const unmappedCount = filtered.filter(r => !r._mapped).length
 
-  const handleTableRowClick = useCallback((row) => {
-    setSelectedRow(row)
-    setActivePopup(row)
-    setTab('map')
-    // small delay lets map tab render before flyTo
-    setTimeout(() => setSelectedRow({ ...row }), 50)
-  }, [])
-
-  function clearFilters() {
-    setFilterState('')
-    setFilterOperator('')
-    setFilterAssetType('')
-    setFilterDateFrom('')
-    setFilterDateTo('')
-    setSearch('')
-  }
-
-  const mapCenter = filtered.length
-    ? [filtered[0]._lat, filtered[0]._lng]
-    : [-25.2744, 133.7751]
-
-  const mapZoom = filtered.length ? 10 : 5
-
-  const activeFiltersCount = [filterState, filterOperator, filterAssetType, filterDateFrom, filterDateTo, search].filter(Boolean).length
+  const activeFilterCount = Object.entries(filters).filter(([, v]) => v !== '').length
 
   return (
     <div className="app-shell">
@@ -223,87 +155,51 @@ export default function App() {
           </div>
         </div>
 
-        {/* upload */}
+        {/* data source */}
         <div className="sidebar-section">
           <div className="section-label">Data Source</div>
           <button className="btn-upload" onClick={() => fileInputRef.current.click()}>
             Upload CSV
           </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv"
-            style={{ display: 'none' }}
-            onChange={handleFileChange}
-          />
-          {uploadFileName && (
+          <input ref={fileInputRef} type="file" accept=".csv" style={{ display: 'none' }} onChange={handleFileChange} />
+          {uploadFile && (
             <div className="upload-meta">
-              <span className="upload-file">{uploadFileName}</span>
+              <span className="upload-file">{uploadFile}</span>
               <span className="upload-count">
-                {allRows.length} rows · {validRows.length} mapped
-                {invalidCount > 0 && ` · ${invalidCount} skipped`}
+                {rows.length} rows · {rows.filter(r => r._mapped).length} mapped
+                {rows.filter(r => !r._mapped).length > 0 && ` · ${rows.filter(r => !r._mapped).length} pending coords`}
               </span>
             </div>
           )}
           {parseError && <div className="parse-error">{parseError}</div>}
-        </div>
-
-        {/* search */}
-        <div className="sidebar-section">
-          <div className="section-label">Search</div>
-          <input
-            className="input-search"
-            placeholder="Address, suburb or operator…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
+          {geocoding && (
+            <div className="geocode-status geocode-running">
+              <span className="spinner" /> {geocodeStatus}
+            </div>
+          )}
+          {!geocoding && geocodeStatus && (
+            <div className="geocode-status geocode-done">{geocodeStatus}</div>
+          )}
         </div>
 
         {/* filters */}
-        <div className="sidebar-section">
-          <div className="section-label-row">
-            <span className="section-label">Filters</span>
-            {activeFiltersCount > 0 && (
-              <button className="btn-clear" onClick={clearFilters}>
-                Clear ({activeFiltersCount})
-              </button>
-            )}
-          </div>
+        <CompsFilters
+          rows={rows}
+          filters={filters}
+          onChange={handleFilterChange}
+          onClear={handleClearFilters}
+        />
 
-          <label className="filter-label">State</label>
-          <select className="input-select" value={filterState} onChange={(e) => setFilterState(e.target.value)}>
-            <option value="">All states</option>
-            {states.map((s) => <option key={s}>{s}</option>)}
-          </select>
-
-          <label className="filter-label">Asset Type</label>
-          <select className="input-select" value={filterAssetType} onChange={(e) => setFilterAssetType(e.target.value)}>
-            <option value="">All asset types</option>
-            {assetTypes.map((s) => <option key={s}>{s}</option>)}
-          </select>
-
-          <label className="filter-label">Operator</label>
-          <select className="input-select" value={filterOperator} onChange={(e) => setFilterOperator(e.target.value)}>
-            <option value="">All operators</option>
-            {operators.map((s) => <option key={s}>{s}</option>)}
-          </select>
-
-          <label className="filter-label">Sale Date From</label>
-          <input className="input-date" type="date" value={filterDateFrom} onChange={(e) => setFilterDateFrom(e.target.value)} />
-
-          <label className="filter-label">Sale Date To</label>
-          <input className="input-date" type="date" value={filterDateTo} onChange={(e) => setFilterDateTo(e.target.value)} />
-        </div>
-
-        {/* results count */}
+        {/* results summary */}
         <div className="results-count">
           {filtered.length} sale{filtered.length !== 1 ? 's' : ''} shown
+          {unmappedCount > 0 && <span className="unmapped-note"> · {unmappedCount} table-only</span>}
         </div>
 
         {/* legend */}
         <div className="sidebar-section legend">
           <div className="section-label">Legend</div>
-          {Object.entries(COLOURS).map(([type, colour]) => (
+          {Object.entries(COLOUR_MAP).map(([type, colour]) => (
             <div key={type} className="legend-row">
               <span className="legend-dot" style={{ background: colour }} />
               <span>{type}</span>
@@ -313,161 +209,38 @@ export default function App() {
             <span className="legend-dot" style={{ background: '#64748b' }} />
             <span>Other</span>
           </div>
+          <div className="legend-row" style={{ marginTop: 8 }}>
+            <span className="status-dot mapped" /><span style={{ marginLeft: 4 }}>Mapped</span>
+            <span className="status-dot unmapped" style={{ marginLeft: 12 }} /><span style={{ marginLeft: 4 }}>No coords</span>
+          </div>
         </div>
       </aside>
 
-      {/* ── main content ── */}
+      {/* ── main ── */}
       <main className="main-content">
-        {/* tab bar */}
         <div className="tab-bar">
-          <button
-            className={`tab-btn ${tab === 'map' ? 'active' : ''}`}
-            onClick={() => setTab('map')}
-          >
+          <button className={`tab-btn ${tab === 'map' ? 'active' : ''}`} onClick={() => setTab('map')}>
             Map View
+            {mappedCount > 0 && <span className="tab-badge">{mappedCount}</span>}
           </button>
-          <button
-            className={`tab-btn ${tab === 'table' ? 'active' : ''}`}
-            onClick={() => setTab('table')}
-          >
+          <button className={`tab-btn ${tab === 'table' ? 'active' : ''}`} onClick={() => setTab('table')}>
             Table View
             {filtered.length > 0 && <span className="tab-badge">{filtered.length}</span>}
           </button>
         </div>
 
-        {/* map */}
         <div className={`map-wrapper ${tab !== 'map' ? 'hidden' : ''}`}>
-          <MapContainer
-            center={mapCenter}
-            zoom={mapZoom}
-            className="leaflet-map"
-            key="main-map"
-          >
-            <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
-            <MapController target={selectedRow} />
-            {filtered.map((row, i) => (
-              <Marker
-                key={i}
-                position={[row._lat, row._lng]}
-                icon={makeIcon(markerColour(row.asset_type))}
-                eventHandlers={{ click: () => handleMarkerClick(row) }}
-              >
-                <Popup className="sale-popup" maxWidth={340}>
-                  <SalePopup row={row} />
-                </Popup>
-              </Marker>
-            ))}
-          </MapContainer>
+          <CompsMap rows={filtered} flyTarget={flyTarget} />
         </div>
 
-        {/* table */}
         {tab === 'table' && (
-          <div className="table-wrapper">
-            {filtered.length === 0 ? (
-              <div className="empty-state">No sales match current filters.</div>
-            ) : (
-              <table className="sales-table">
-                <thead>
-                  <tr>
-                    <th>Address</th>
-                    <th>Suburb</th>
-                    <th>State</th>
-                    <th>Asset Type</th>
-                    <th>Operator</th>
-                    <th>Sale Price</th>
-                    <th>Sale Date</th>
-                    <th>Yield</th>
-                    <th>NLA</th>
-                    <th>Source</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.map((row, i) => (
-                    <tr
-                      key={i}
-                      ref={(el) => (tableRowRefs.current[i] = el)}
-                      className={selectedRow === row ? 'row-selected' : ''}
-                      onClick={() => handleTableRowClick(row)}
-                    >
-                      <td className="td-address">{row.address || '—'}</td>
-                      <td>{row.suburb || '—'}</td>
-                      <td>{row.state || '—'}</td>
-                      <td>
-                        <span
-                          className="asset-badge"
-                          style={{ background: markerColour(row.asset_type) + '22', color: markerColour(row.asset_type), borderColor: markerColour(row.asset_type) + '66' }}
-                        >
-                          {row.asset_type || '—'}
-                        </span>
-                      </td>
-                      <td>{row.operator || '—'}</td>
-                      <td className="td-num">{fmtCurrency(row.sale_price_aud)}</td>
-                      <td className="td-num">{fmtDate(row.sale_date)}</td>
-                      <td className="td-num">{fmtYield(row.yield)}</td>
-                      <td className="td-num">{fmtNum(row.nla_sqm)}</td>
-                      <td className="td-source">{row.source_report ? `${row.source_report}${row.source_page ? ` p.${row.source_page}` : ''}` : '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+          <CompsTable
+            rows={filtered}
+            selectedRow={selectedRow}
+            onRowClick={handleTableRowClick}
+          />
         )}
       </main>
-    </div>
-  )
-}
-
-// ─── popup component ──────────────────────────────────────────────────────────
-
-function SalePopup({ row }) {
-  return (
-    <div className="popup-inner">
-      <div className="popup-header">
-        <div className="popup-address">{row.address}</div>
-        <div className="popup-suburb">{[row.suburb, row.state, row.postcode].filter(Boolean).join(', ')}</div>
-        <span
-          className="popup-badge"
-          style={{ background: markerColour(row.asset_type) + '22', color: markerColour(row.asset_type), borderColor: markerColour(row.asset_type) + '55' }}
-        >
-          {row.asset_type}
-        </span>
-      </div>
-
-      <div className="popup-price">{fmtCurrency(row.sale_price_aud)}</div>
-
-      <div className="popup-grid">
-        <PopupField label="Sale Date" value={fmtDate(row.sale_date)} />
-        <PopupField label="Yield" value={fmtYield(row.yield)} />
-        <PopupField label="Operator" value={row.operator} />
-        <PopupField label="NLA" value={fmtNum(row.nla_sqm)} />
-        <PopupField label="Site Area" value={fmtNum(row.site_area_sqm)} />
-        <PopupField label="Price / m²" value={row.price_per_sqm ? fmtCurrency(row.price_per_sqm) + '/m²' : '—'} />
-        <PopupField label="Purchaser" value={row.purchaser} />
-        <PopupField label="Vendor" value={row.vendor} />
-      </div>
-
-      {row.comments && (
-        <div className="popup-comments">{row.comments}</div>
-      )}
-
-      <div className="popup-source">
-        <span className="popup-source-label">Source</span>
-        {row.source_report || '—'}
-        {row.source_page && <> · p.{row.source_page}</>}
-      </div>
-    </div>
-  )
-}
-
-function PopupField({ label, value }) {
-  return (
-    <div className="popup-field">
-      <div className="popup-field-label">{label}</div>
-      <div className="popup-field-value">{value || '—'}</div>
     </div>
   )
 }
