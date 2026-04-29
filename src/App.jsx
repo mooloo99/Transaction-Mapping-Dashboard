@@ -34,7 +34,7 @@ export default function App() {
 
   // auto-load the geocoded dataset on startup
   useEffect(() => {
-    fetch('/comparable_sales_geocoded.csv')
+    fetch(`${import.meta.env.BASE_URL}comparable_sales_geocoded.csv`)
       .then(r => r.text())
       .then(text => {
         const parsed = parseCsvText(text)
@@ -45,7 +45,7 @@ export default function App() {
       })
       .catch(() => {
         // fallback to sample
-        fetch('/comparable_sales.csv')
+        fetch(`${import.meta.env.BASE_URL}comparable_sales.csv`)
           .then(r => r.text())
           .then(text => {
             const parsed = parseCsvText(text)
